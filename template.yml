@@ -1,0 +1,152 @@
+# This is the SAM template that represents the architecture of the serverless application
+# https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/serverless-sam-template-basics.html
+
+# The AWSTemplateFormatVersion identifies the capabilities of the template
+# https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/format-version-structure.html
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  aws-instagram-proxy
+  API Gateway and Lambda functions to query Instagram and return domain-friendly images
+
+# Transform section specifies one or more macros that AWS CloudFormation uses to process your template
+# https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/transform-section-structure.html
+Transform:
+- AWS::Serverless-2016-10-31
+
+# Set expected parameter to be passed for sam to used for 'sam deploy' or 'sam local start-api'
+Parameters:
+  Stage:
+    Type: String
+    Default: Stage
+    Description: Parameter for getting the deployment stage
+  StagingName:
+    Type: String
+    Default: Staging
+    Description: Used to label stage name and API Output URL
+  ProdName:
+    Type: String
+    Default: Production
+    Description: Used to label production name and API Output URL
+
+# Create a condition based on the parameter for deployment stages
+Conditions:
+  isStagingEnvironment: !Equals
+    - Ref: Stage
+    - Stage
+
+# Global environment settings for handlers that can be overwritten using env.json
+Globals:
+  Function:
+    Timeout: 30
+    Runtime: nodejs14.x
+    Environment:
+      Variables:
+        API_MAPPING: '' # If a domain mapping has been setup, this can be used instead of the api stage URL path, e.g. '/igproxy' in https://api.com/igproxy
+        ALLOWED_DOMAIN_ORIGINS: "{ \"origins\": [ \"example1.com\", \"example2.com\" ]}" # Handler processes these as a JSON array
+        IG_SEARCH_PATH: '/graphql/query' # Path on instagram.com to perform query
+        IG_PROTOCOL: 'https' 
+        IG_SESSION_ID: '' # You need to log in via a browser and search request header cookie value for 'sessionid=' 
+        IG_TAG_QUERY_HASH: '298b92c8d7cad703f7565aa892ede943' # The query signature that Instagram accepts in order to query tags
+        IG_USER_QUERY_HASH: '472f257a40c653c64c666ce877d59d2b' # The query signature that Instagram accepts in order to query users
+        IG_RETURN_FIRST: 20 # How many rows of three images to return. 20 rows X 3 = 60 images
+        IG_COOKIE_DOMAIN: 'instagram.com' # This is replaced by the value of COOKIE_DOMAIN
+        IG_HOST_DOMAIN: 'www.instagram.com' # This is part of the proxy request URL
+        COOKIE_DOMAIN: '' # The proxy resets the cookie domain from instagram.com to this
+        HEADERS_API_ID: InstagramProxy # This is in the response headers only to help confirm you're actually using the proxy
+        IMG_SERVICE_PROTOCOL: 'https' # This is the protocol of the Proxy Image function serving img-request.js
+        IMG_SERVICE_BASE_PATH: '/img'
+        STAGE_ID: !If
+          [
+          isStagingEnvironment, 
+          !Ref StagingName,
+          !Ref ProdName
+          ]
+
+# Resources declares the AWS resources that you want to include in the stack
+# https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/resources-section-structure.html
+Resources:
+  # The API Gateway initiates the calls to src/handlers/ig-request.js
+  IgApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: Instagram Proxy Api Gateway
+      StageName: !If
+        [ 
+        isStagingEnvironment,
+        !Ref StagingName,
+        !Ref ProdName,
+        ]
+      BinaryMediaTypes:
+        - "*~1*"
+        - "image~1webp"
+        - "image~1jpeg"
+        - "image~1gif"
+        - "image~1svg+xml"
+        - "image~1ico"
+        - "image~1png"
+      MethodSettings:
+        - HttpMethod: '*'
+          ResourcePath: '/*'
+          DataTraceEnabled: true
+          CacheTtlInSeconds: 3600
+          CachingEnabled: true
+          ThrottlingRateLimit: 10
+
+  # Each Lambda function is defined by properties:
+  # https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+
+  # This is a Lambda function config associated with the source code: ig-request.js
+  igProxyHandler:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/handlers
+      Handler: ig-request.igRequestHandler
+      Description: The primary request to Instagram, including an HTTP get method to retrieve and return IG JSON.
+      Events:
+        IgProxyApi:
+          Type: Api
+          Properties:
+            RestApiId: 
+              Ref: IgApiGateway
+            Path: /search/{type}/{value}
+            Method: GET
+  
+  # This is a Lambda function config associated with the source code: img-request.js
+  imageProxyHandler:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/handlers
+      Handler: img-request.imgRequestHandler
+      Description: An Instagram image proxy that takes igRequestHandler image src responses, fetches image data, then returns it
+      Timeout: 600
+      Events:
+        IgProxyApi:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: IgApiGateway
+            Path: /img
+            Method: GET
+
+Outputs:
+  IgApiGateway:
+    Description: 'API Gateway endpoint URL for Staging of IG Request function'
+    Value: !If
+      [
+      isStagingEnvironment, 
+      'https://${IgApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${StagingName}/igproxy',
+      'https://${IgApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${ProdName}/igproxy'
+      ]
+  IgApiGatewayRestApiId:
+    Description: 'API Gateway ARN for IgApiGateway'
+    Value: 
+      Ref: IgApiGateway
+    Export: 
+      Name: IgApiGateway-RestApi
+  IgApiGatewayRootResourceId:
+    Value: 
+      Fn::GetAtt:
+        - IgApiGateway
+        - RootResourceId
+    Export:
+      Name: IgApiGateway-RootResourceId
